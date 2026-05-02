@@ -1,44 +1,45 @@
 import React, { useState, useRef } from 'react';
 
-const API_URL = 'http://127.0.0.1:8000';
-// const API_URL = 'https://y-downloader.duckdns.org';
+const API_URL = process.env.REACT_APP_API_URL || 'http://127.0.0.1:8000';
 
-function getFilenameFromCD(cd) {
-    if (!cd) return null;
-    // Prefer RFC 5987 encoded name
-    const m1 = /filename\*=UTF-8''([^;]+)/i.exec(cd);
-    if (m1) {
-        try { return decodeURIComponent(m1[1]); } catch {}
-    }
-    const m2 = /filename="?([^";]+)"?/i.exec(cd);
-    return m2 ? m2[1] : null;
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+function formatDuration(seconds) {
+    if (!seconds) return '';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    return `${m}:${String(s).padStart(2, '0')}`;
 }
 
+function formatSize(bytes) {
+    if (!bytes) return '';
+    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
+    return `${Math.round(bytes / 1e3)} KB`;
+}
+
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
 export default function DownloadForm() {
-    const [url, setUrl] = useState('');
-    const [quality, setQuality] = useState('720p');
-    const [phase, setPhase] = useState('idle'); // idle | preparing | downloading | transferring | error
-    const [progress, setProgress] = useState(0);
-    const [speed, setSpeed] = useState('');
-    const [eta, setEta] = useState('');
-    const [err, setErr] = useState(null);
+    const [url, setUrl]               = useState('');
+    const [loading, setLoading]       = useState(false);
+    const [videoInfo, setVideoInfo]   = useState(null);
+    const [err, setErr]               = useState(null);
+
+    // quality string of the stream currently being server-processed, or null
+    const [serverBusy, setServerBusy] = useState(null);
+    const [serverErr, setServerErr]   = useState(null);
     const inputRef = useRef(null);
-    const pollRef = useRef(null);
 
-    const stopPolling = () => {
-        if (pollRef.current) {
-            clearInterval(pollRef.current);
-            pollRef.current = null;
-        }
-    };
-
+    // -----------------------------------------------------------------------
+    // Step 1 — fetch metadata
+    // -----------------------------------------------------------------------
     const handleSubmit = async (e) => {
         e.preventDefault();
-        setErr(null);
-        setProgress(0);
-        setSpeed('');
-        setEta('');
-
         const trimmed = url.trim();
         if (!trimmed) {
             setErr('Please paste a YouTube URL.');
@@ -46,210 +47,239 @@ export default function DownloadForm() {
             return;
         }
 
-        setPhase('preparing');
+        setErr(null);
+        setVideoInfo(null);
+        setLoading(true);
+
         try {
-            // 1. Start the download task on the server
-            const startRes = await fetch(`${API_URL}/api/download-yt/`, {
-                method: 'POST',
+            const res  = await fetch(`${API_URL}/api/extract/`, {
+                method:  'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ url: trimmed, quality }),
+                body:    JSON.stringify({ url: trimmed }),
             });
-            if (!startRes.ok) {
-                const j = await startRes.json().catch(() => ({}));
-                throw new Error(j?.error || `Server error ${startRes.status}`);
-            }
-            const { task_id } = await startRes.json();
+            const data = await res.json();
+            if (!res.ok) throw new Error(data?.error || `Server error ${res.status}`);
+            if (!data.streams?.length) throw new Error('No downloadable streams found for this video.');
 
-            // 2. Poll for yt-dlp progress (server-side download)
-            setPhase('downloading');
-            await new Promise((resolve, reject) => {
-                pollRef.current = setInterval(async () => {
-                    try {
-                        const r = await fetch(`${API_URL}/api/progress/${task_id}/`);
-                        if (!r.ok) throw new Error(`Progress check failed: ${r.status}`);
-                        const data = await r.json();
-
-                        if (data.status === 'error') {
-                            stopPolling();
-                            reject(new Error(data.error || 'Download failed on server'));
-                            return;
-                        }
-
-                        setProgress(data.percent || 0);
-                        setSpeed(data.speed || '');
-                        setEta(data.eta || '');
-
-                        if (data.status === 'complete') {
-                            stopPolling();
-                            resolve();
-                        }
-                    } catch (pollErr) {
-                        stopPolling();
-                        reject(pollErr);
-                    }
-                }, 1000);
-            });
-
-            // 3. Transfer the file to the browser with progress tracking
-            setPhase('transferring');
-            setProgress(0);
-
-            const fileRes = await fetch(`${API_URL}/api/download/${task_id}/`);
-            if (!fileRes.ok) {
-                const j = await fileRes.json().catch(() => ({}));
-                throw new Error(j?.error || `Download error ${fileRes.status}`);
-            }
-
-            const contentLength = +fileRes.headers.get('Content-Length') || 0;
-            const cd = fileRes.headers.get('Content-Disposition');
-            const filename = getFilenameFromCD(cd) || 'video.mp4';
-
-            const reader = fileRes.body.getReader();
-            const chunks = [];
-            let received = 0;
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                chunks.push(value);
-                received += value.length;
-                if (contentLength > 0) {
-                    setProgress(Math.round((received / contentLength) * 100));
-                }
-            }
-
-            const blob = new Blob(chunks, { type: 'video/mp4' });
-            const dlUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = dlUrl;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            URL.revokeObjectURL(dlUrl);
-
-            setUrl('');
-            setPhase('idle');
-            setProgress(0);
+            // Store the original URL so the download endpoint can re-validate it
+            setVideoInfo({ ...data, originalUrl: trimmed });
         } catch (e) {
-            stopPolling();
-            setErr(e?.message || 'Something went wrong');
-            setPhase('error');
+            setErr(e.message || 'Something went wrong.');
+        } finally {
+            setLoading(false);
         }
     };
 
-    const isActive = phase === 'preparing' || phase === 'downloading' || phase === 'transferring';
+    // -----------------------------------------------------------------------
+    // Step 2a — direct download (client-side, no server involvement)
+    // -----------------------------------------------------------------------
+    // Rendered as a plain <a href> — browser downloads straight from YouTube CDN.
 
-    const phaseLabel = {
-        preparing: 'Preparing…',
-        downloading: 'Downloading on server…',
-        transferring: 'Saving to device…',
+    // -----------------------------------------------------------------------
+    // Step 2b — server-required download (1080p+)
+    // -----------------------------------------------------------------------
+    const handleServerDownload = async (stream) => {
+        setServerBusy(stream.quality);
+        setServerErr(null);
+
+        try {
+            const res = await fetch(`${API_URL}/api/download-high-quality/`, {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({
+                    url:       videoInfo.originalUrl,
+                    format_id: stream.format_id,
+                }),
+            });
+
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                throw new Error(data?.error || `Server error ${res.status}`);
+            }
+
+            const { token } = await res.json();
+
+            // Browser-native download — no Blob, no JS memory buffering.
+            // The browser streams the file directly from the serve-download endpoint to disk.
+            const a = document.createElement('a');
+            a.href  = `${API_URL}/api/serve-download/${token}/`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        } catch (e) {
+            setServerErr(e.message || 'Download failed. Please try again.');
+        } finally {
+            // Give the browser a moment to initiate the navigation before re-enabling the button.
+            setTimeout(() => setServerBusy(null), 2000);
+        }
     };
 
-    const isIndeterminate = phase === 'preparing' || (phase === 'downloading' && progress === 0);
+    const handleReset = () => {
+        setVideoInfo(null);
+        setErr(null);
+        setServerErr(null);
+        setUrl('');
+    };
+
+    // -----------------------------------------------------------------------
+    // Render — URL input screen
+    // -----------------------------------------------------------------------
+    if (!videoInfo) {
+        return (
+            <div style={styles.wrapper}>
+                <form onSubmit={handleSubmit} style={styles.form}>
+                    <label htmlFor="yturl" style={styles.label}>YouTube URL</label>
+                    <input
+                        id="yturl"
+                        ref={inputRef}
+                        type="url"
+                        inputMode="url"
+                        placeholder="https://youtu.be/..."
+                        value={url}
+                        onChange={(e) => setUrl(e.target.value)}
+                        disabled={loading}
+                        required
+                        style={styles.input}
+                    />
+                    <button
+                        type="submit"
+                        disabled={loading}
+                        style={{
+                            ...styles.primaryBtn,
+                            background: loading ? '#9ca3af' : '#2563eb',
+                            cursor: loading ? 'not-allowed' : 'pointer',
+                        }}
+                    >
+                        {loading ? 'Fetching video info…' : 'Get Download Links'}
+                    </button>
+                    {err && <p style={styles.error}>{err}</p>}
+                    <p style={styles.hint}>Only YouTube URLs are supported.</p>
+                </form>
+            </div>
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Render — results screen
+    // -----------------------------------------------------------------------
+    const directStreams = videoInfo.streams.filter(s => s.type === 'direct');
+    const serverStreams = videoInfo.streams.filter(s => s.type === 'server_required');
 
     return (
         <div style={styles.wrapper}>
-            <form onSubmit={handleSubmit} style={styles.form}>
-                <label htmlFor="yturl" style={styles.label}>YouTube URL</label>
-                <input
-                    id="yturl"
-                    ref={inputRef}
-                    type="url"
-                    inputMode="url"
-                    placeholder="https://youtu.be/..."
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    disabled={isActive}
-                    required
-                    style={styles.input}
-                />
-                <div style={styles.qualityRow}>
-                    {[
-                        { value: '720p',  label: '720p',       sub: 'HD' },
-                        { value: '1080p', label: '1080p',      sub: 'Full HD' },
-                        { value: '4k',    label: '4K',         sub: 'Ultra HD' },
-                    ].map(({ value, label, sub }) => (
-                        <button
-                            key={value}
-                            type="button"
-                            disabled={isActive}
-                            onClick={() => setQuality(value)}
-                            style={{
-                                ...styles.qualityBtn,
-                                background: quality === value ? '#2563eb' : '#f3f4f6',
-                                color: quality === value ? '#fff' : '#374151',
-                                border: quality === value ? '2px solid #2563eb' : '2px solid transparent',
-                                cursor: isActive ? 'not-allowed' : 'pointer',
-                                opacity: isActive ? 0.6 : 1,
-                            }}
+            {/* Thumbnail */}
+            {videoInfo.thumbnail && (
+                <img src={videoInfo.thumbnail} alt={videoInfo.title} style={styles.thumbnail} />
+            )}
+
+            {/* Title + duration */}
+            <div style={styles.meta}>
+                <p style={styles.title}>{videoInfo.title}</p>
+                {videoInfo.duration > 0 && (
+                    <p style={styles.duration}>{formatDuration(videoInfo.duration)}</p>
+                )}
+            </div>
+
+            {/* ── Direct downloads ────────────────────────────────────────── */}
+            {directStreams.length > 0 && (
+                <div style={styles.section}>
+                    {directStreams.map((stream) => (
+                        <a
+                            key={stream.quality}
+                            href={stream.url}
+                            download={`${videoInfo.title}.${stream.ext}`}
+                            target="_blank"
+                            rel="noreferrer"
+                            style={styles.streamRow}
                         >
-                            <span style={{ fontWeight: 700, fontSize: 15 }}>{label}</span>
-                            <span style={{ fontSize: 11, opacity: 0.8 }}>{sub}</span>
-                        </button>
+                            <span style={styles.qualityLabel}>{stream.quality}</span>
+                            <span style={styles.streamDetail}>
+                                {stream.ext.toUpperCase()}
+                                {stream.filesize ? ` · ${formatSize(stream.filesize)}` : ''}
+                            </span>
+                            <span style={{ ...styles.badge, ...styles.badgeDirect }}>
+                                Fast download
+                            </span>
+                            <span style={styles.arrow}>↓</span>
+                        </a>
                     ))}
                 </div>
+            )}
 
-                <button
-                    type="submit"
-                    disabled={isActive}
-                    style={{
-                        ...styles.button,
-                        background: isActive ? '#9ca3af' : '#2563eb',
-                        cursor: isActive ? 'not-allowed' : 'pointer',
-                    }}
-                >
-                    {isActive ? phaseLabel[phase] : 'Download'}
-                </button>
+            {/* ── Server-processed downloads (1080p+) ─────────────────────── */}
+            {serverStreams.length > 0 && (
+                <div style={styles.section}>
+                    {serverStreams.map((stream) => {
+                        const isThisOne = serverBusy === stream.quality;
+                        const anyBusy   = serverBusy !== null;
 
-                {isActive && (
-                    <div style={styles.progressContainer}>
-                        <div style={styles.progressTrack}>
-                            <div
+                        return (
+                            <button
+                                key={stream.quality}
+                                onClick={() => handleServerDownload(stream)}
+                                disabled={anyBusy}
                                 style={{
-                                    ...styles.progressBar,
-                                    width: isIndeterminate ? '40%' : `${progress}%`,
-                                    animation: isIndeterminate ? 'slide 1.4s ease-in-out infinite' : 'none',
+                                    ...styles.streamRow,
+                                    ...styles.streamBtn,
+                                    opacity: anyBusy && !isThisOne ? 0.5 : 1,
+                                    cursor:  anyBusy ? 'not-allowed' : 'pointer',
+                                    background: isThisOne ? '#eff6ff' : '#f3f4f6',
+                                    borderColor: isThisOne ? '#93c5fd' : 'transparent',
                                 }}
-                            />
-                        </div>
-                        <div style={styles.progressMeta}>
-                            <span>
-                                {phase === 'preparing'
-                                    ? 'Starting…'
-                                    : phase === 'transferring'
-                                    ? `Saving to disk — ${progress}%`
-                                    : progress > 0
-                                    ? `${progress.toFixed(1)}%`
-                                    : 'Starting yt-dlp…'}
-                            </span>
-                            <span style={{ color: '#9ca3af' }}>
-                                {speed && `${speed}`}
-                                {eta && eta !== '00:00' && ` · ETA ${eta}`}
-                            </span>
-                        </div>
-                    </div>
-                )}
+                            >
+                                <span style={styles.qualityLabel}>{stream.quality}</span>
+                                <span style={styles.streamDetail}>
+                                    {stream.ext.toUpperCase()}
+                                    {stream.filesize ? ` · ${formatSize(stream.filesize)}` : ''}
+                                </span>
+                                <span style={{ ...styles.badge, ...styles.badgeServer }}>
+                                    HD · server
+                                </span>
+                                {isThisOne
+                                    ? <span style={styles.spinner} />
+                                    : <span style={styles.arrow}>↓</span>
+                                }
+                            </button>
+                        );
+                    })}
 
-                {err && <p style={styles.error}>{err}</p>}
-                <p style={styles.hint}>
-                    Video is fetched on the server at the selected quality, then downloaded to your browser.
-                </p>
-            </form>
+                    {/* Processing notice */}
+                    {serverBusy && (
+                        <div style={styles.processingBox}>
+                            <p style={styles.processingText}>
+                                Processing {serverBusy} — downloading &amp; merging on server…
+                            </p>
+                            <p style={styles.processingHint}>
+                                This may take 1–5 minutes depending on video length. Please keep this tab open.
+                            </p>
+                        </div>
+                    )}
+
+                    {serverErr && <p style={styles.error}>{serverErr}</p>}
+                </div>
+            )}
+
+            <button onClick={handleReset} style={styles.resetBtn}>
+                ← Download another video
+            </button>
 
             <style>{`
-                @keyframes slide {
-                    0%   { margin-left: 0;    margin-right: 60%; }
-                    50%  { margin-left: 30%;  margin-right: 0;   }
-                    100% { margin-left: 0;    margin-right: 60%; }
-                }
+                @keyframes spin { to { transform: rotate(360deg); } }
             `}</style>
         </div>
     );
 }
 
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
 const styles = {
-    wrapper: { maxWidth: 520, margin: '24px auto' },
+    wrapper: {
+        maxWidth: 540,
+        margin: '24px auto',
+        display: 'grid',
+        gap: 16,
+    },
     form: { display: 'grid', gap: 12 },
     label: { fontWeight: 600 },
     input: {
@@ -257,8 +287,10 @@ const styles = {
         fontSize: 16,
         borderRadius: 8,
         border: '1px solid #c9ccd1',
+        boxSizing: 'border-box',
+        width: '100%',
     },
-    button: {
+    primaryBtn: {
         padding: '10px 14px',
         fontSize: 16,
         borderRadius: 8,
@@ -267,36 +299,83 @@ const styles = {
         fontWeight: 600,
         transition: 'background 0.2s',
     },
-    qualityRow: { display: 'flex', gap: 8 },
-    qualityBtn: {
-        flex: 1,
-        padding: '8px 4px',
+    error: { color: '#b00020', margin: 0, fontSize: 14 },
+    hint:  { color: '#6b7280', fontSize: 13, margin: 0 },
+    thumbnail: {
+        width: '100%',
         borderRadius: 8,
+        objectFit: 'cover',
+        maxHeight: 220,
+    },
+    meta:     { display: 'grid', gap: 4 },
+    title:    { margin: 0, fontWeight: 700, fontSize: 16, lineHeight: 1.4 },
+    duration: { margin: 0, color: '#6b7280', fontSize: 14 },
+    section:  { display: 'grid', gap: 8 },
+
+    // Shared row style (used by both <a> and <button>)
+    streamRow: {
         display: 'flex',
-        flexDirection: 'column',
         alignItems: 'center',
-        gap: 2,
-        transition: 'all 0.15s',
+        gap: 10,
+        padding: '12px 14px',
+        background: '#f3f4f6',
+        borderRadius: 8,
+        textDecoration: 'none',
+        color: '#111827',
+        border: '2px solid transparent',
+        transition: 'border-color 0.15s, background 0.15s',
     },
-    progressContainer: { display: 'grid', gap: 6 },
-    progressTrack: {
-        height: 8,
-        background: '#e5e7eb',
-        borderRadius: 4,
-        overflow: 'hidden',
+    // Extra reset for the <button> variant
+    streamBtn: {
+        width: '100%',
+        textAlign: 'left',
+        fontFamily: 'inherit',
+        fontSize: 'inherit',
     },
-    progressBar: {
-        height: '100%',
-        background: '#2563eb',
-        borderRadius: 4,
-        transition: 'width 0.3s ease',
+
+    qualityLabel: { fontWeight: 700, fontSize: 15, minWidth: 46 },
+    streamDetail: { color: '#6b7280', fontSize: 13, flex: 1 },
+    arrow:        { fontWeight: 700, color: '#2563eb', fontSize: 18 },
+
+    badge: {
+        fontSize: 11,
+        fontWeight: 600,
+        padding: '2px 8px',
+        borderRadius: 99,
+        whiteSpace: 'nowrap',
     },
-    progressMeta: {
-        display: 'flex',
-        justifyContent: 'space-between',
-        fontSize: 13,
-        color: '#6b7280',
+    badgeDirect: { background: '#dcfce7', color: '#166534' },
+    badgeServer: { background: '#dbeafe', color: '#1e40af' },
+
+    spinner: {
+        display: 'inline-block',
+        width: 16,
+        height: 16,
+        border: '2px solid #bfdbfe',
+        borderTopColor: '#2563eb',
+        borderRadius: '50%',
+        animation: 'spin 0.8s linear infinite',
+        flexShrink: 0,
     },
-    error: { color: '#b00020', margin: 0 },
-    hint: { color: '#6b7280', fontSize: 13, margin: 0 },
+
+    processingBox: {
+        background: '#eff6ff',
+        border: '1px solid #bfdbfe',
+        borderRadius: 8,
+        padding: '12px 14px',
+        display: 'grid',
+        gap: 4,
+    },
+    processingText: { margin: 0, fontWeight: 600, fontSize: 14, color: '#1e40af' },
+    processingHint: { margin: 0, fontSize: 13, color: '#3b82f6' },
+
+    resetBtn: {
+        background: 'none',
+        border: 'none',
+        color: '#2563eb',
+        cursor: 'pointer',
+        fontSize: 14,
+        padding: 0,
+        textAlign: 'left',
+    },
 };
